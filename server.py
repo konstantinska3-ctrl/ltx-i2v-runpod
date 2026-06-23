@@ -6,6 +6,7 @@ import base64
 import gc
 import io
 import os
+import threading
 import time
 from typing import Any
 
@@ -30,6 +31,8 @@ NEGATIVE_PROMPT = os.getenv(
 
 app = FastAPI(title="LTX I2V RunPod Server", version="1.0.0")
 PIPELINE: LTXImageToVideoPipeline | None = None
+LOADING = False
+LOAD_ERROR: str | None = None
 
 
 class GenerateRequest(BaseModel):
@@ -56,31 +59,52 @@ def _decode_image(data: str) -> Image.Image:
 
 
 def _load_pipeline() -> LTXImageToVideoPipeline:
-    global PIPELINE
+    global PIPELINE, LOAD_ERROR
     if PIPELINE is not None:
         return PIPELINE
+    if LOAD_ERROR:
+        raise RuntimeError(LOAD_ERROR)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU not available inside container")
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     print(f"Loading {MODEL_ID} ({dtype})...")
     t0 = time.time()
-    pipe = LTXImageToVideoPipeline.from_pretrained(MODEL_ID, torch_dtype=dtype)
-    pipe.enable_model_cpu_offload()
-    pipe.vae.enable_tiling()
+    try:
+        pipe = LTXImageToVideoPipeline.from_pretrained(MODEL_ID, torch_dtype=dtype)
+        pipe.enable_model_cpu_offload()
+        pipe.vae.enable_tiling()
+    except Exception as exc:  # noqa: BLE001
+        LOAD_ERROR = str(exc)
+        raise
     PIPELINE = pipe
     print(f"Model ready in {time.time() - t0:.1f}s")
     return PIPELINE
 
 
+def _load_pipeline_background() -> None:
+    global LOADING, LOAD_ERROR
+    LOADING = True
+    try:
+        _load_pipeline()
+    except Exception as exc:  # noqa: BLE001
+        LOAD_ERROR = str(exc)
+        print(f"Model load failed: {exc}")
+    finally:
+        LOADING = False
+
+
 @app.on_event("startup")
 def warmup() -> None:
-    _load_pipeline()
+    threading.Thread(target=_load_pipeline_background, daemon=True).start()
 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    if LOAD_ERROR:
+        raise HTTPException(status_code=500, detail=LOAD_ERROR)
+    ready = PIPELINE is not None and not LOADING
     return {
-        "status": "ok",
+        "status": "ok" if ready else "loading",
         "model": MODEL_ID,
         "cuda": torch.cuda.is_available(),
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
@@ -94,6 +118,8 @@ def generate(req: GenerateRequest) -> GenerateResponse:
         w = req.width or WIDTH
         h = req.height or HEIGHT
         image = image.resize((w, h), Image.Resampling.LANCZOS)
+        if LOADING or PIPELINE is None:
+            raise HTTPException(status_code=503, detail="Model is still loading")
         pipe = _load_pipeline()
         t0 = time.time()
         frames = pipe(
